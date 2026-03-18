@@ -214,7 +214,7 @@ test_pc_associations <- function(pca, metadata, n_pcs = 10, block = NULL,
                         d2   <- s["test_var", "df"]
                         eta  <- NA_real_
                     } else {
-                        a    <- lmerTest::anova(full_fit)
+                        a    <- anova(full_fit)
                         stat <- a["test_var", "F value"]
                         pval <- a["test_var", "Pr(>F)"]
                         d1   <- a["test_var", "NumDF"]
