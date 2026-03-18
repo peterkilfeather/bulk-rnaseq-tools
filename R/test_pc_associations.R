@@ -313,7 +313,7 @@ test_pc_associations <- function(pca, metadata, n_pcs = 10, block = NULL,
     if (plot) {
         plot_df <- results
         plot_df$neg_log10_p <- pmin(-log10(plot_df$p_adj), 10)
-        plot_df$neg_log10_p[is.na(plot_df$neg_log10_p)] <- 0
+        plot_df$neg_log10_p[is.na(plot_df$p_adj) | plot_df$p_adj >= 0.05] <- NA
 
         # Significance stars
         plot_df$stars <- ifelse(is.na(plot_df$p_adj), "",
@@ -336,7 +336,8 @@ test_pc_associations <- function(pca, metadata, n_pcs = 10, block = NULL,
             ggplot2::geom_text(ggplot2::aes(label = stars), size = 4) +
             ggplot2::scale_fill_gradient(
                 low = "white", high = "red",
-                name = expression(-log[10](p[adj]))
+                name = expression(-log[10](p[adj])),
+                na.value = "grey90"
             ) +
             ggplot2::theme_minimal() +
             ggplot2::labs(x = NULL, y = NULL) +
