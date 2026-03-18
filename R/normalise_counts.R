@@ -15,11 +15,13 @@ normalise_counts <- function(counts, group = NULL, filter = TRUE) {
 
     # -- Input handling --------------------------------------------------------
     if (is.character(counts) && length(counts) == 1L) {
+        message("Reading counts from file...")
         counts <- read.delim(counts, row.names = 1, check.names = FALSE)
     }
     counts <- as.matrix(counts)
 
     # -- DGEList ---------------------------------------------------------------
+    message("Creating DGEList...")
     dge <- edgeR::DGEList(counts = counts)
 
     # -- Design matrix ---------------------------------------------------------
@@ -33,26 +35,33 @@ normalise_counts <- function(counts, group = NULL, filter = TRUE) {
 
     # -- Filtering -------------------------------------------------------------
     if (filter) {
+        message("Filtering lowly expressed genes...")
         kept_genes <- edgeR::filterByExpr(dge, design = design)
         dge <- dge[kept_genes, , keep.lib.sizes = FALSE]
+        message("Kept ", sum(kept_genes), " of ", length(kept_genes), " genes")
     } else {
         kept_genes <- rep(TRUE, nrow(dge))
         names(kept_genes) <- rownames(dge)
     }
 
     # -- TMM normalization -----------------------------------------------------
+    message("Calculating TMM normalization factors...")
     dge <- edgeR::calcNormFactors(dge)
 
     # -- logCPM ----------------------------------------------------------------
+    message("Computing logCPM...")
     logcpm <- edgeR::cpm(dge, log = TRUE)
 
     # -- Voom ------------------------------------------------------------------
+    message("Running voom...")
     voom_result <- limma::voom(dge, design = design)
 
     # -- Voom with sample weights ----------------------------------------------
+    message("Running voom with sample quality weights...")
     voom_sw_result <- limma::voomWithQualityWeights(dge, design = design)
 
     # -- Return ----------------------------------------------------------------
+    message("Done.")
     list(
         logcpm              = logcpm,
         voom                = voom_result$E,
