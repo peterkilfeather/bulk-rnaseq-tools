@@ -14,6 +14,10 @@
 #'                   weighting. If NULL, uniform \code{1/k} weights are used.
 #' @param p_threshold Adjusted p-value threshold for significance (default 0.05).
 #' @param max_covariates Maximum number of covariates to add stepwise (default 3).
+#' @param combinations  Logical; if TRUE, test all covariate subsets up to
+#'                      \code{max_covariates} instead of building a strict
+#'                      sequential ladder.  Default FALSE preserves backward
+#'                      compatibility.
 #'
 #' @return A named list:
 #'   \item{covariate_ranking}{Tibble of candidate covariates ranked by weighted
@@ -28,7 +32,7 @@
 #'         associated with sample weights.}
 suggest_models <- function(pc_assoc, base_formula, metadata, block,
                            pca = NULL, p_threshold = 0.05,
-                           max_covariates = 3) {
+                           max_covariates = 3, combinations = FALSE) {
 
     # -- Input validation ------------------------------------------------------
     if (!is.list(pc_assoc) || is.null(pc_assoc$results)) {
@@ -59,6 +63,10 @@ suggest_models <- function(pc_assoc, base_formula, metadata, block,
     }
     if (!block %in% colnames(metadata)) {
         stop("`block` column '", block, "' not found in metadata")
+    }
+
+    if (!is.logical(combinations) || length(combinations) != 1L) {
+        stop("`combinations` must be TRUE or FALSE")
     }
 
     # Check formula variables exist in metadata
@@ -212,86 +220,111 @@ suggest_models <- function(pc_assoc, base_formula, metadata, block,
         ))
     }
 
-    current_covariates <- character(0)
-    n_added <- 0L
-
-    for (cov in sig_candidates) {
-        if (n_added >= max_covariates) break
-
-        trial_covariates <- c(current_covariates, cov)
-        trial_formula <- extend_formula(base_formula, trial_covariates)
-
-        # Build design matrix, checking for NA-induced row drops
-        trial_design <- tryCatch(
-            model.matrix(trial_formula, data = metadata),
-            error = function(e) {
-                message("Cannot build design with '", cov,
-                        "': ", e$message, " — skipping")
-                skipped[[length(skipped) + 1L]] <<- data.frame(
+    if (combinations) {
+        # -- Combinatorial branch --------------------------------------------------
+        # Pre-filter: keep covariates that are individually valid
+        valid_covariates <- character(0)
+        for (cov in sig_candidates) {
+            if (length(valid_covariates) >= max_covariates) break
+            result <- try_design(base_formula, cov, metadata, n_samples)
+            if (result$valid) {
+                valid_covariates <- c(valid_covariates, cov)
+            } else {
+                message("Covariate '", cov, "' invalid individually: ",
+                        result$reason, " — excluding from combinations")
+                skipped[[length(skipped) + 1L]] <- data.frame(
                     variable = cov,
                     score = covariate_ranking$score[
                         covariate_ranking$variable == cov],
-                    reason = paste("model.matrix error:", e$message),
+                    reason = result$reason,
                     stringsAsFactors = FALSE
                 )
-                NULL
             }
-        )
-        if (is.null(trial_design)) next
-
-        # Check for row drops from NAs
-        if (nrow(trial_design) != n_samples) {
-            warning("Adding '", cov, "' drops ",
-                    n_samples - nrow(trial_design),
-                    " samples due to NAs — skipping")
-            skipped[[length(skipped) + 1L]] <- data.frame(
-                variable = cov,
-                score = covariate_ranking$score[
-                    covariate_ranking$variable == cov],
-                reason = paste0("drops ", n_samples - nrow(trial_design),
-                                " samples due to NAs"),
-                stringsAsFactors = FALSE
-            )
-            next
         }
 
-        # Check rank deficiency
-        design_rank <- qr(trial_design)$rank
-        if (design_rank < ncol(trial_design)) {
-            message("Adding '", cov, "' causes rank deficiency (",
-                    design_rank, " vs ", ncol(trial_design),
-                    " columns) — skipping")
-            skipped[[length(skipped) + 1L]] <- data.frame(
-                variable = cov,
-                score = covariate_ranking$score[
-                    covariate_ranking$variable == cov],
-                reason = paste0("rank deficient (rank ", design_rank,
-                                " < ", ncol(trial_design), " columns)"),
-                stringsAsFactors = FALSE
-            )
-            next
+        # Generate all subsets, ordered by size (1, 2, ..., k)
+        if (length(valid_covariates) > 0L) {
+            for (size in seq_len(length(valid_covariates))) {
+                combos <- utils::combn(valid_covariates, size,
+                                       simplify = FALSE)
+                for (covset in combos) {
+                    result <- try_design(base_formula, covset,
+                                         metadata, n_samples)
+                    if (result$valid) {
+                        model_name <- paste(covset, collapse = "_")
+                        models[[length(models) + 1L]] <- list(
+                            name = model_name,
+                            formula = result$formula,
+                            design = result$design,
+                            covariates = covset
+                        )
+                        message("Valid combination: '", model_name,
+                                "' (", ncol(result$design), " columns)")
+                    } else {
+                        skipped[[length(skipped) + 1L]] <- data.frame(
+                            variable = paste(covset, collapse = " + "),
+                            score = NA_real_,
+                            reason = result$reason,
+                            stringsAsFactors = FALSE
+                        )
+                        message("Combination '",
+                                paste(covset, collapse = " + "),
+                                "' skipped: ", result$reason)
+                    }
+                }
+            }
         }
 
-        # Valid — add this covariate
-        current_covariates <- trial_covariates
-        n_added <- n_added + 1L
-        model_name <- paste0("base_plus_", n_added)
+        if (length(models) == 1L) {
+            warning("All covariate combinations caused rank deficiency — ",
+                    "returning base model only")
+        }
+    } else {
+        # -- Sequential ladder (original behaviour) --------------------------------
+        current_covariates <- character(0)
+        n_added <- 0L
 
-        models[[length(models) + 1L]] <- list(
-            name = model_name,
-            formula = trial_formula,
-            design = trial_design,
-            covariates = current_covariates
-        )
+        for (cov in sig_candidates) {
+            if (n_added >= max_covariates) break
 
-        message("Added '", cov, "' -> model '", model_name,
-                "' (", ncol(trial_design), " columns, rank ",
-                design_rank, ")")
-    }
+            trial_covariates <- c(current_covariates, cov)
+            result <- try_design(base_formula, trial_covariates,
+                                 metadata, n_samples)
 
-    if (n_added == 0L) {
-        warning("All candidate covariates caused rank deficiency — ",
-                "returning base model only")
+            if (!result$valid) {
+                message("Adding '", cov, "' failed: ", result$reason,
+                        " — skipping")
+                skipped[[length(skipped) + 1L]] <- data.frame(
+                    variable = cov,
+                    score = covariate_ranking$score[
+                        covariate_ranking$variable == cov],
+                    reason = result$reason,
+                    stringsAsFactors = FALSE
+                )
+                next
+            }
+
+            # Valid — add this covariate
+            current_covariates <- trial_covariates
+            n_added <- n_added + 1L
+            model_name <- paste0("base_plus_", n_added)
+
+            models[[length(models) + 1L]] <- list(
+                name = model_name,
+                formula = result$formula,
+                design = result$design,
+                covariates = current_covariates
+            )
+
+            message("Added '", cov, "' -> model '", model_name,
+                    "' (", ncol(result$design), " columns, rank ",
+                    qr(result$design)$rank, ")")
+        }
+
+        if (n_added == 0L) {
+            warning("All candidate covariates caused rank deficiency — ",
+                    "returning base model only")
+        }
     }
 
     # -- Assemble skipped tibble -----------------------------------------------
@@ -313,6 +346,27 @@ suggest_models <- function(pc_assoc, base_formula, metadata, block,
         sample_weights_flag = sample_weights_flag,
         sample_weights_vars = sample_weights_vars
     )
+}
+
+
+# -- Internal helper: check whether a covariate set produces a valid design ----
+#' @noRd
+try_design <- function(base_formula, covariates, metadata, n_samples) {
+    trial_formula <- extend_formula(base_formula, covariates)
+    trial_design <- tryCatch(
+        model.matrix(trial_formula, data = metadata),
+        error = function(e) NULL
+    )
+    if (is.null(trial_design))
+        return(list(valid = FALSE, reason = "model.matrix error"))
+    if (nrow(trial_design) != n_samples)
+        return(list(valid = FALSE, reason = paste0("drops ",
+            n_samples - nrow(trial_design), " samples due to NAs")))
+    design_rank <- qr(trial_design)$rank
+    if (design_rank < ncol(trial_design))
+        return(list(valid = FALSE, reason = paste0("rank deficient (rank ",
+            design_rank, " < ", ncol(trial_design), " columns)")))
+    list(valid = TRUE, design = trial_design, formula = trial_formula)
 }
 
 
