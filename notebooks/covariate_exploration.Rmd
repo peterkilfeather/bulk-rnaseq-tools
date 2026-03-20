@@ -1,0 +1,464 @@
+---
+title: "Covariate exploration and model selection"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7
+)
+```
+
+# Setup & data loading
+
+A systematic covariate exploration was performed to identify metadata variables
+driving variation in the RNA-seq data, collapse redundant covariates, and
+select the best-fitting design for differential expression testing. The
+analysis proceeded through normalisation (TMM + voom with two-pass
+`duplicateCorrelation`), PCA to identify dominant axes of variation,
+mixed-model testing of PC--metadata associations, hierarchical clustering
+of correlated covariates, stepwise model building, and model comparison on
+fit quality and DE concordance.
+
+## Load pipeline functions and libraries
+
+```{r load-functions}
+source("../R/normalise_counts.R")
+source("../R/test_pc_associations.R")
+source("../R/plot_pca.R")
+source("../R/cluster_covariates.R")
+source("../R/suggest_models.R")
+source("../R/compare_voom_models.R")
+source("../R/select_model.R")
+
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(patchwork)
+library(tibble)
+library(dplyr)
+library(lmerTest)
+library(lme4)
+```
+
+## Input data format
+
+The `eval=FALSE` chunk below shows how real count and metadata files would be
+loaded. For this analysis, simulated data were used instead (see next section).
+
+```{r your-data, eval=FALSE}
+counts   <- as.matrix(read.delim("path/to/counts.tsv", row.names = 1))
+metadata <- read.delim("path/to/metadata.tsv")
+
+# Ensure sample order matches
+stopifnot(identical(colnames(counts), rownames(metadata)))
+```
+
+## Simulated demo data
+
+A simulated dataset with known covariate structure was used to demonstrate the
+pipeline end-to-end. The simulation produced 12 subjects x 2 conditions
+(Ctrl/Treat) x 2 timepoints (T1/T2) = 48 samples, with covariates wired to
+specific PCs:
+
+| Covariate            | Expected signal                          |
+|----------------------|------------------------------------------|
+| `group`/`condition`  | Strong effect on a top PC                |
+| `rna_quality`        | Moderate--strong effect on a top PC      |
+| `batch` / `sex`      | Confounded; shared effect on a top PC    |
+| `age`                | Weaker continuous effect                 |
+| `library_size_proxy` | Noise (negative control, not significant)|
+
+```{r simulate-data}
+set.seed(42)
+
+n_genes    <- 10000
+n_subjects <- 12
+conditions <- c("Ctrl", "Treat")
+timepoints <- c("T1", "T2")
+
+# -- Metadata --
+metadata <- expand.grid(
+  subject   = paste0("S", seq_len(n_subjects)),
+  condition = conditions,
+  timepoint = timepoints,
+  stringsAsFactors = FALSE
+)
+metadata$sample_id <- paste(metadata$subject, metadata$condition,
+                            metadata$timepoint, sep = "_")
+rownames(metadata) <- metadata$sample_id
+
+# Group label (condition x timepoint)
+metadata$group <- factor(paste0(metadata$condition, ".", metadata$timepoint),
+                         levels = c("Ctrl.T1", "Ctrl.T2",
+                                    "Treat.T1", "Treat.T2"))
+
+# Subject-level covariates (constant within subject)
+subj_info <- data.frame(
+  subject = paste0("S", seq_len(n_subjects)),
+  sex     = c("F", "F", "M", "F", "M", "M",
+              "F", "M", "M", "F", "M", "F"),
+  batch   = c("A", "A", "B", "A", "B", "B",
+              "A", "B", "B", "A", "B", "A"),
+  age     = c(25, 32, 45, 28, 51, 39, 27, 44, 50, 30, 48, 35),
+  stringsAsFactors = FALSE
+)
+metadata <- merge(metadata, subj_info, by = "subject", sort = FALSE)
+rownames(metadata) <- metadata$sample_id
+
+# Sample-level covariates
+metadata$rna_quality       <- round(rnorm(nrow(metadata), mean = 8, sd = 1.5), 1)
+metadata$library_size_proxy <- round(runif(nrow(metadata), 20, 40), 1)
+
+# Reorder rows to match sample_id column
+metadata <- metadata[order(metadata$sample_id), ]
+
+# -- Counts matrix --
+# Build log-expression matrix, then convert to counts.
+# This gives precise control over covariate effects on PCs.
+n_samples  <- nrow(metadata)
+base_mean  <- rnorm(n_genes, mean = 6, sd = 1.5)        # log2 scale
+log_expr   <- matrix(base_mean, nrow = n_genes, ncol = n_samples)
+
+# Subject random intercept (intra-subject correlation)
+subject_effects <- matrix(
+  rnorm(n_genes * n_subjects, sd = 0.3),
+  nrow = n_genes, ncol = n_subjects,
+  dimnames = list(NULL, paste0("S", seq_len(n_subjects)))
+)
+for (i in seq_len(n_samples)) {
+  log_expr[, i] <- log_expr[, i] + subject_effects[, metadata$subject[i]]
+}
+
+# group effect -> PC1: large fold changes in 2000 genes for Treat samples
+group_genes <- 1:2000
+treat_idx   <- metadata$condition == "Treat"
+group_fc    <- rnorm(length(group_genes), mean = 0, sd = 1.5)
+log_expr[group_genes, treat_idx] <- log_expr[group_genes, treat_idx] +
+  outer(group_fc, rep(1, sum(treat_idx)))
+
+# rna_quality -> PC2: proportional shift in 2000 genes
+rna_genes <- 2001:4000
+rna_z     <- scale(metadata$rna_quality)[, 1]
+rna_coef  <- rnorm(length(rna_genes), mean = 0, sd = 0.8)
+log_expr[rna_genes, ] <- log_expr[rna_genes, ] +
+  outer(rna_coef, rna_z)
+
+# batch/sex (confounded) -> PC3: shift in 1500 genes
+batch_genes <- 4001:5500
+batch_z     <- ifelse(metadata$batch == "B", 1, -1)
+batch_coef  <- rnorm(length(batch_genes), mean = 0, sd = 0.7)
+log_expr[batch_genes, ] <- log_expr[batch_genes, ] +
+  outer(batch_coef, batch_z)
+
+# age -> PC4: weaker continuous effect on 800 genes
+age_genes <- 5501:6300
+age_z     <- scale(metadata$age)[, 1]
+age_coef  <- rnorm(length(age_genes), mean = 0, sd = 0.4)
+log_expr[age_genes, ] <- log_expr[age_genes, ] +
+  outer(age_coef, age_z)
+
+# library_size_proxy: NO effect (negative control)
+
+# Add residual noise
+log_expr <- log_expr + matrix(rnorm(n_genes * n_samples, sd = 0.5),
+                               nrow = n_genes, ncol = n_samples)
+
+# Convert to counts via NB sampling around the log-expression means
+mu <- 2^log_expr
+mu[mu < 1] <- 1
+counts <- matrix(
+  rnbinom(n_genes * n_samples, mu = as.vector(mu), size = 20),
+  nrow = n_genes, ncol = n_samples,
+  dimnames = list(paste0("gene_", seq_len(n_genes)), metadata$sample_id)
+)
+counts[counts < 0] <- 0L
+storage.mode(counts) <- "integer"
+
+cat("Counts matrix:", nrow(counts), "genes x", ncol(counts), "samples\n")
+cat("Metadata columns:", paste(names(metadata), collapse = ", "), "\n")
+```
+
+
+# Normalisation
+
+Lowly-expressed genes were filtered with `edgeR::filterByExpr`, TMM
+normalisation was applied, and both `voom` and `voomWithQualityWeights` were run with two-pass
+`duplicateCorrelation` to account for the repeated-measures blocking structure.
+
+```{r normalise}
+norm <- normalise_counts(counts, group = metadata$group, block = metadata$subject)
+```
+
+```{r normalise-summary}
+cat("Genes retained after filtering:", sum(norm$kept_genes), "/",
+    length(norm$kept_genes), "\n")
+cat("Block correlation (voom):               ",
+    round(norm$block_correlation, 4), "\n")
+cat("Block correlation (voomWithQualityWeights):",
+    round(norm$block_correlation_sw, 4), "\n")
+cat("\nSample weight summary:\n")
+print(summary(norm$sample_weights))
+```
+
+
+# PCA
+
+PCA was run on the voom-normalised expression matrix to identify the major axes
+of variation across samples. Genes were centred and scaled prior to
+decomposition with `prcomp`.
+
+```{r pca}
+pca <- prcomp(t(norm$voom), center = TRUE, scale. = TRUE)
+```
+
+```{r scree-plot, fig.width=6, fig.height=4}
+var_explained <- summary(pca)$importance[2, 1:10] * 100
+scree_df <- data.frame(
+  PC       = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)),
+  Variance = var_explained
+)
+
+ggplot(scree_df, aes(PC, Variance)) +
+  geom_col(fill = "#4575B4") +
+  labs(y = "% Variance Explained", title = "Scree Plot") +
+  theme_minimal()
+```
+
+
+# PCA score plots (PC1 vs PC2)
+
+Associations between the first 10 PCs and all metadata variables were tested
+using mixed models. The default PC1 vs PC2 plane was then visualised coloured by
+each variable. Stars in panel titles reflect the strength of association.
+
+```{r test-associations}
+pc_assoc <- test_pc_associations(
+  pca, metadata[, !names(metadata) %in% c("sample_id")],
+  n_pcs = 10,
+  block = "subject",
+  sample_weights = norm$sample_weights,
+  plot = FALSE
+)
+```
+
+```{r pca-score-plots-default, fig.width=12, fig.height=10}
+pca_plots <- plot_pca(
+  pca,
+  metadata[, !names(metadata) %in% c("sample_id")],
+  pc_assoc
+)
+pca_plots$combined_plot
+```
+
+
+# PC--metadata association heatmap
+
+The heatmap displayed $-\log_{10}(p_\text{adj})$ for each variable--PC pair.
+Grey tiles were non-significant; coloured tiles indicated progressively
+stronger associations, with stars marking significance levels (\* *p* < 0.05,
+\*\* *p* < 0.01, \*\*\* *p* < 0.001). Because the experiment used a
+repeated-measures design, all associations were tested with linear mixed models
+including a `(1|subject)` random intercept.
+
+```{r heatmap, fig.width=10, fig.height=6}
+pc_assoc$plot
+```
+
+```{r association-table}
+pc_assoc$results |>
+  dplyr::filter(p_adj < 0.05) |>
+  dplyr::arrange(p_adj)
+```
+
+**Findings:**
+
+- Variables associated with multiple PCs indicated broad technical confounding
+  (e.g. `rna_quality`).
+- Variables on the dominant PCs (PC1, PC2) reflected biological signal
+  (e.g. `group`) or major batch effects.
+- Sample-weight associations informed whether `voomWithQualityWeights` was
+  warranted.
+
+
+# Covariate clustering
+
+Correlated covariates can cause multicollinearity when included together in a
+model. Pairwise associations were computed (Spearman for continuous--continuous,
+$\sqrt{\eta^2}$ for numeric--categorical, Cramer's V for
+categorical--categorical), covariates were clustered hierarchically, and one
+representative per cluster was selected based on PC-association score. `group` was excluded
+as the variable of interest; `subject` was excluded as the blocking variable.
+
+```{r cluster-covariates, fig.width=10, fig.height=7}
+clust <- cluster_covariates(
+  metadata[, !names(metadata) %in% c("sample_id")],
+  pc_assoc = pc_assoc,
+  pca      = pca,
+  block    = "subject",
+  exclude  = c("group")
+)
+clust$plot
+```
+
+```{r cluster-table}
+clust$clusters
+```
+
+**Findings:**
+
+- The dendrogram grouped covariates by similarity; the dashed line marked the
+  clustering threshold.
+- `*` next to a variable name denotes the cluster representative.
+- `batch` and `sex` clustered together as expected given their confounding.
+  Only the representative was carried forward for model building.
+
+
+# PCA score plots (per-variable optimal PCs)
+
+The default PC1 x PC2 view missed variables whose effects lay on lower PCs.
+Each variable was re-plotted on its two most-associated PCs to give a clearer
+picture of where each covariate acted.
+
+```{r pca-per-variable, fig.width=12, fig.height=10}
+pca_per_var <- plot_pca(
+  pca,
+  metadata[, !names(metadata) %in% c("sample_id")],
+  pc_assoc,
+  per_variable_pcs = TRUE
+)
+pca_per_var$combined_plot
+```
+
+**Findings:**
+
+- Compared with the default PC1 x PC2 plots above, variables like
+  `rna_quality` now appeared on PC2 x PC3 or similar, revealing structure
+  invisible in the first two components.
+
+
+# Suggest candidate models
+
+Significant covariates were ranked by a variance-weighted score
+($\sum R^2 \times \text{PC variance proportion}$ across significant PCs) and
+candidate design matrices were built stepwise, checking for rank deficiency at each
+addition. The filtered PC associations from the clustering step were used so
+that redundant covariates were excluded.
+
+```{r suggest-models}
+suggested <- suggest_models(
+  pc_assoc     = clust$pc_assoc_filtered,
+  base_formula = ~ 0 + group,
+  metadata     = metadata,
+  block        = "subject",
+  pca          = pca
+)
+```
+
+```{r covariate-ranking}
+suggested$covariate_ranking
+```
+
+```{r candidate-models}
+for (m in suggested$models) {
+  cat(m$name, ":", deparse(m$formula), "\n")
+}
+```
+
+```{r sample-weights-flag}
+if (suggested$sample_weights_flag) {
+  cat("Sample weights are significantly associated with PC variation.\n",
+      "voomWithQualityWeights will be compared in the next step.\n")
+} else {
+  cat("Sample weights are not significantly associated with any PC.\n")
+}
+```
+
+
+# Compare voom models
+
+For each candidate design, both `voom` and `voomWithQualityWeights` were fit
+with two-pass `duplicateCorrelation`. Models were then compared on median RMSE,
+median R^2^, DE gene counts, and concordance metrics (logFC correlation, rank
+correlation, Jaccard index). The four-panel diagnostic plot showed RMSE and
+R^2^ densities, DE counts, and a logFC scatter.
+
+```{r compare-models, results="asis", fig.width=10, fig.height=8}
+contrast    <- "groupTreat.T1 - groupCtrl.T1"
+comparisons <- list()
+
+for (m in suggested$models) {
+  cat("\n\n##", m$name, "\n\n")
+
+  comparisons[[m$name]] <- compare_voom_models(
+    dge      = norm$dge,
+    design   = m$design,
+    contrast = contrast,
+    block    = metadata$subject
+  )
+
+  cat("\n**Summary:**\n\n")
+  print(knitr::kable(comparisons[[m$name]]$summary, digits = 4))
+  cat("\n")
+  print(comparisons[[m$name]]$plot)
+  cat("\n")
+}
+```
+
+**Findings:**
+
+- Lower median RMSE indicated better fit; higher median R^2^ indicated more
+  variance explained by the design.
+- The logFC scatter fell tightly along the diagonal where models agreed,
+  confirming high concordance.
+- Models with worse fit but more DE genes were flagged as potentially
+  inflating false positives.
+
+
+# Select best model
+
+`select_model()` picked the best voom strategy (voom vs
+voomWithQualityWeights) within each design based on RMSE and R^2^, then
+compared across designs. A 1% parsimony threshold favoured simpler models
+unless a more complex model offered a meaningful improvement.
+
+```{r select-model}
+selection <- select_model(comparisons)
+```
+
+```{r selection-summary}
+selection$design_summary
+```
+
+```{r recommendation}
+message("Recommended design:  ", selection$design)
+message("Recommended strategy: ", selection$recommended)
+message("Reason: ", selection$reason)
+```
+
+
+# Summary & next steps
+
+The pipeline recommended **`r selection$design`** with
+**`r selection$recommended`** as the best-fitting model for this dataset.
+The fitted model objects were extracted for downstream differential expression
+analysis:
+
+```{r next-steps, eval=FALSE}
+# Extract the fitted model objects
+efit      <- selection$model$efit
+top_table <- selection$model$top_table
+
+# Apply significance thresholds
+de_results <- limma::decideTests(efit, p.value = 0.05, lfc = 0)
+summary(de_results)
+
+# Downstream: volcano plots, gene set enrichment, pathway analysis, etc.
+```
