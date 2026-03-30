@@ -621,12 +621,85 @@ pick_best_design <- function(design_winners, comparisons = NULL,
         }
     }
 
+    # Refinement check: after concordance override (or parsimony), check whether
+    # a more complex design within the RMSE window has better RMSE and a
+    # high-overlap DE gene set (its DEGs are largely a subset of the current
+    # selection's).  This catches known technical covariates (e.g. plate/batch)
+    # that reduce residual error and trim false positives without adding new
+    # discoveries.
+    refined <- FALSE
+    if (selected_idx < n_designs && !is.null(comparisons)) {
+        cur_winner <- design_winners[[selected_idx]]$winner
+        cur_rmse   <- rmses[selected_idx]
+        cur_n_de   <- n_des[selected_idx]
+        cur_model  <- comparisons[[design_names[selected_idx]]]$models[[cur_winner]]
+
+        for (k in (selected_idx + 1L):n_designs) {
+            rel_diff_k <- (rmses[k] - best_rmse) / best_rmse
+            if (rel_diff_k > threshold) next
+            if (rmses[k] >= cur_rmse) next  # must have strictly better RMSE
+
+            ref_winner <- design_winners[[k]]$winner
+            ref_n_de   <- n_des[k]
+            ref_model  <- comparisons[[design_names[k]]]$models[[ref_winner]]
+
+            # Skip if the candidate has more DE genes (handled by concordance)
+            if (ref_n_de >= cur_n_de) next
+
+            # Check that the refined model's DE genes are largely a subset of
+            # the current selection's, with consistent logFC
+            logfc_cor_k <- stats::cor(cur_model$top_table$logFC,
+                                       ref_model$top_table$logFC,
+                                       method = "pearson")
+
+            if (ref_n_de > 0L) {
+                n_shared <- length(intersect(ref_model$de_genes,
+                                              cur_model$de_genes))
+                ref_subset_frac <- n_shared / ref_n_de
+            } else {
+                ref_subset_frac <- 1.0
+            }
+
+            ref_ok <- ref_subset_frac >= 0.80 &&
+                      !is.na(logfc_cor_k) && logfc_cor_k >= 0.95
+
+            if (verbose) {
+                cur_label <- paste0(design_names[selected_idx], "/", cur_winner)
+                ref_label <- paste0(design_names[k], "/", ref_winner)
+                message("\n  Refinement check (", cur_label,
+                        " vs ", ref_label, "):")
+                message(sprintf("    RMSE: %s=%s, %s=%s",
+                                cur_label, format_num(cur_rmse),
+                                ref_label, format_num(rmses[k])))
+                message(sprintf("    DE genes: %s=%d, %s=%d",
+                                cur_label, cur_n_de,
+                                ref_label, ref_n_de))
+                message(sprintf("    Subset overlap: %.0f%% of %s DE genes in %s",
+                                ref_subset_frac * 100, ref_label, cur_label))
+                message(sprintf("    LogFC correlation: %.4f", logfc_cor_k))
+                message(sprintf("    Verdict: %s",
+                                if (ref_ok) "refinement accepted"
+                                else "refinement rejected"))
+            }
+
+            if (ref_ok) {
+                selected_idx <- k
+                refined <- TRUE
+                break
+            }
+        }
+    }
+
     selected_design <- design_names[selected_idx]
     selected_winner <- design_winners[[selected_idx]]$winner
     selected_rmse   <- rmses[selected_idx]
 
     # Build reason
-    if (selected_idx == best_idx) {
+    if (refined) {
+        reason <- paste0(
+            selected_design, " selected: better RMSE with high DE gene overlap ",
+            "(technical covariate refinement)")
+    } else if (selected_idx == best_idx) {
         if (n_designs > 1L) {
             # The best RMSE design was selected
             second_best_rmse <- sort(rmses)[2L]
