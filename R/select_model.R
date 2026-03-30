@@ -163,27 +163,70 @@ pick_voom_strategy <- function(comp, design_name, verbose = TRUE) {
     m1 <- blocked[m1_idx, ]
     m2 <- blocked[m2_idx, ]
 
-    rmse_better  <- if (m1$median_rmse < m2$median_rmse) m1$model
-                    else if (m2$median_rmse < m1$median_rmse) m2$model
-                    else "tied"
-    r2_better    <- if (m1$median_r_squared > m2$median_r_squared) m1$model
-                    else if (m2$median_r_squared > m1$median_r_squared) m2$model
-                    else "tied"
+    # Direction winners
+    rmse_winner <- if (m1$median_rmse < m2$median_rmse) m1$model
+                   else if (m2$median_rmse < m1$median_rmse) m2$model
+                   else "tied"
+    r2_winner   <- if (m1$median_r_squared > m2$median_r_squared) m1$model
+                   else if (m2$median_r_squared > m1$median_r_squared) m2$model
+                   else "tied"
 
-    # Decision logic
-    if (rmse_better == r2_better && rmse_better != "tied") {
-        winner_name <- rmse_better
-    } else if (rmse_better != "tied" && r2_better != "tied" &&
-               rmse_better != r2_better) {
-        # Disagree — prefer lower RMSE
-        winner_name <- rmse_better
-    } else if (rmse_better != "tied") {
-        winner_name <- rmse_better
-    } else if (r2_better != "tied") {
-        winner_name <- r2_better
+    # Relative difference magnitudes (% of better value)
+    rmse_min <- min(m1$median_rmse, m2$median_rmse)
+    if (rmse_min > 0) {
+        rmse_rel_pct <- abs(m1$median_rmse - m2$median_rmse) / rmse_min * 100
     } else {
-        # Both tied — prefer simpler (voom_block)
-        winner_name <- "voom_block"
+        rmse_rel_pct <- 0
+        rmse_winner  <- "tied"
+    }
+
+    r2_max <- max(m1$median_r_squared, m2$median_r_squared)
+    if (r2_max > 0) {
+        r2_rel_pct <- abs(m1$median_r_squared - m2$median_r_squared) / r2_max * 100
+    } else {
+        r2_rel_pct <- 0
+        r2_winner  <- "tied"
+    }
+
+    negligible_pct <- 1.0  # differences below 1% are essentially tied
+
+    # Decision logic — magnitude-aware
+    if (rmse_winner == r2_winner && rmse_winner != "tied") {
+        winner_name <- rmse_winner
+        decision_reason <- "both metrics agree"
+    } else if (rmse_rel_pct < negligible_pct && r2_rel_pct < negligible_pct) {
+        winner_name <- m1$model
+        decision_reason <- sprintf(
+            "metrics disagree but both differences negligible (<%.0f%%); preferring simpler model",
+            negligible_pct)
+    } else if (rmse_winner != "tied" && r2_winner != "tied" &&
+               rmse_winner != r2_winner) {
+        # Disagree — whichever metric has the larger relative difference wins
+        if (r2_rel_pct > rmse_rel_pct) {
+            winner_name <- r2_winner
+            decision_reason <- sprintf(
+                "metrics disagree: R2 difference (%.1f%%) outweighs RMSE difference (%.1f%%)",
+                r2_rel_pct, rmse_rel_pct)
+        } else if (rmse_rel_pct > r2_rel_pct) {
+            winner_name <- rmse_winner
+            decision_reason <- sprintf(
+                "metrics disagree: RMSE difference (%.1f%%) outweighs R2 difference (%.1f%%)",
+                rmse_rel_pct, r2_rel_pct)
+        } else {
+            winner_name <- m1$model
+            decision_reason <- sprintf(
+                "metrics disagree with equal relative differences (%.1f%%); preferring simpler model",
+                rmse_rel_pct)
+        }
+    } else if (rmse_winner != "tied") {
+        winner_name <- rmse_winner
+        decision_reason <- "R2 tied; decided by RMSE"
+    } else if (r2_winner != "tied") {
+        winner_name <- r2_winner
+        decision_reason <- "RMSE tied; decided by R2"
+    } else {
+        winner_name <- m1$model
+        decision_reason <- "both metrics tied; preferring simpler model"
     }
 
     winner_row <- blocked[blocked$model == winner_name, ]
@@ -202,7 +245,7 @@ pick_voom_strategy <- function(comp, design_name, verbose = TRUE) {
 
     # Verbose output
     if (verbose) {
-        print_voom_comparison(design_name, m1, m2, winner_name)
+        print_voom_comparison(design_name, m1, m2, winner_name, decision_reason)
     }
 
     list(
@@ -293,7 +336,8 @@ pick_best_design <- function(design_winners, verbose = TRUE) {
 
 #' Print the voom strategy comparison table for one design
 #' @noRd
-print_voom_comparison <- function(design_name, m1, m2, winner_name) {
+print_voom_comparison <- function(design_name, m1, m2, winner_name,
+                                  decision_reason = NULL) {
     message("\n-- Design: ", design_name, " --")
 
     metrics <- c("median_rmse", "median_r_squared", "n_de", "n_up", "n_down",
@@ -305,8 +349,8 @@ print_voom_comparison <- function(design_name, m1, m2, winner_name) {
 
     # Header
     message(format_table_row(
-        c("Metric", m1$model, m2$model),
-        widths = c(20, 18, 18)
+        c("Metric", m1$model, m2$model, "rel_diff"),
+        widths = c(20, 18, 18, 12)
     ))
 
     for (metric in metrics) {
@@ -330,14 +374,31 @@ print_voom_comparison <- function(design_name, m1, m2, winner_name) {
             s2 <- format_num(v2)
         }
 
+        # Relative difference for the two key metrics
+        rel_str <- ""
+        if (metric == "median_rmse") {
+            denom <- min(v1, v2)
+            if (denom > 0) {
+                rel_str <- paste0(format_num(abs(v1 - v2) / denom * 100), "%")
+            }
+        } else if (metric == "median_r_squared") {
+            denom <- max(v1, v2)
+            if (denom > 0) {
+                rel_str <- paste0(format_num(abs(v1 - v2) / denom * 100), "%")
+            }
+        }
+
         message(format_table_row(
-            c(metric, paste0(s1, star1), paste0(s2, star2)),
-            widths = c(20, 18, 18)
+            c(metric, paste0(s1, star1), paste0(s2, star2), rel_str),
+            widths = c(20, 18, 18, 12)
         ))
     }
 
     message("  * = better on this metric")
     message("  Winner: ", winner_name)
+    if (!is.null(decision_reason)) {
+        message("  Reason: ", decision_reason)
+    }
 }
 
 
