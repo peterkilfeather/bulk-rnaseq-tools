@@ -162,21 +162,35 @@ rethreshold_models <- function(comparisons, fdr, lfc) {
         for (mn in model_names) {
             m <- comp$models[[mn]]
 
-            # Re-test using treat() on the stored pre-eBayes contrast fit
-            if (lfc > 0 && !is.null(m$cfit)) {
-                treat_fit <- limma::treat(m$cfit, lfc = lfc)
-            } else if (!is.null(m$cfit)) {
-                treat_fit <- limma::eBayes(m$cfit)
+            if (!is.null(m$cfit)) {
+                # Preferred: re-test via treat() on the pre-eBayes contrast fit
+                if (lfc > 0) {
+                    treat_fit <- limma::treat(m$cfit, lfc = lfc)
+                } else {
+                    treat_fit <- limma::eBayes(m$cfit)
+                }
+                dt <- limma::decideTests(treat_fit, p.value = fdr, lfc = lfc)
+                n_up   <- sum(dt > 0)
+                n_down <- sum(dt < 0)
+                de_genes <- rownames(dt)[dt != 0]
             } else {
-                # Fallback: cfit not available (old compare_voom_models output)
-                treat_fit <- m$efit
+                # Fallback: cfit not stored (pre-existing models) — post-hoc
+                # filter on top_table.  This is NOT a formal treat() test.
+                warning("Model '", mn, "' in design '", design_name,
+                        "' has no stored contrast fit (cfit); ",
+                        "falling back to post-hoc logFC/FDR filter ",
+                        "instead of limma::treat()", call. = FALSE)
+                top <- m$top_table
+                is_up   <- !is.na(top$adj.P.Val) & top$adj.P.Val < fdr &
+                           top$logFC >= lfc
+                is_down <- !is.na(top$adj.P.Val) & top$adj.P.Val < fdr &
+                           top$logFC <= -lfc
+                n_up     <- sum(is_up)
+                n_down   <- sum(is_down)
+                de_genes <- rownames(top)[is_up | is_down]
             }
 
-            dt <- limma::decideTests(treat_fit, p.value = fdr, lfc = lfc)
-            n_up   <- sum(dt > 0)
-            n_down <- sum(dt < 0)
-
-            comp$models[[mn]]$de_genes <- rownames(dt)[dt != 0]
+            comp$models[[mn]]$de_genes <- de_genes
             comp$models[[mn]]$n_de     <- n_up + n_down
             comp$models[[mn]]$n_up     <- n_up
             comp$models[[mn]]$n_down   <- n_down
