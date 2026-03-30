@@ -190,6 +190,7 @@ compare_voom_models <- function(dge, design, contrast, block,
         list(
             voom_obj         = voom_obj,
             fit              = fit,
+            cfit             = cfit,
             efit             = efit,
             top_table        = top,
             rmse             = rmse,

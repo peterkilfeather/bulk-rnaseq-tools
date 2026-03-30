@@ -8,6 +8,13 @@
 #' @param comparisons Either a single \code{compare_voom_models()} output, or a
 #'   named list of them (one per design, e.g., from running
 #'   \code{compare_voom_models()} on each design from \code{suggest_models()}).
+#' @param lfc_threshold Numeric; minimum absolute log-fold-change for DE gene
+#'   counting during model selection. When > 0, \code{limma::treat()} is used
+#'   to formally test H0: |logFC| <= threshold on each model's stored contrast
+#'   fit, giving calibrated p-values. Default 0 (use the DE calls from
+#'   \code{compare_voom_models()} as-is).
+#' @param fdr_threshold Numeric; FDR cutoff for DE gene counting during model
+#'   selection. Default 0.05.
 #' @param verbose Logical; print a recommendation report via \code{message()}
 #'   (default TRUE).
 #'
@@ -19,10 +26,23 @@
 #'     top_table, de_genes, etc.).}
 #'   \item{design_summary}{Tibble: cross-design comparison with one row per
 #'     design, showing the winning voom strategy and its metrics.}
-select_model <- function(comparisons, verbose = TRUE) {
+select_model <- function(comparisons, lfc_threshold = 0,
+                          fdr_threshold = 0.05, verbose = TRUE) {
 
     # -- Input handling --------------------------------------------------------
     comparisons <- validate_comparisons(comparisons)
+
+    # -- Optional re-thresholding via treat() ----------------------------------
+    if (lfc_threshold > 0 || fdr_threshold != 0.05) {
+        comparisons <- rethreshold_models(comparisons, fdr_threshold,
+                                           lfc_threshold)
+        if (verbose) {
+            message("Re-thresholded DE genes for selection: FDR=",
+                    fdr_threshold, ", |logFC|>",
+                    round(lfc_threshold, 3),
+                    if (lfc_threshold > 0) " (limma::treat)" else "")
+        }
+    }
 
     # -- Stage 1: Within each design, pick the best voom strategy --------------
     design_winners <- lapply(names(comparisons), function(design_name) {
@@ -125,6 +145,69 @@ validate_comparisons <- function(comparisons) {
          "A single output should have $summary, $models, and $concordance.\n",
          "A multi-design input should be a named list of such outputs.",
          call. = FALSE)
+}
+
+
+#' Re-threshold DE genes across all models using limma::treat()
+#'
+#' Deep-copies \code{comparisons} and re-derives DE gene sets for every model
+#' in every design via \code{limma::treat()} + \code{limma::decideTests()}.
+#' Also recomputes the \code{concordance$de_overlap} tibble.
+#' @noRd
+rethreshold_models <- function(comparisons, fdr, lfc) {
+    for (design_name in names(comparisons)) {
+        comp <- comparisons[[design_name]]
+        model_names <- names(comp$models)
+
+        for (mn in model_names) {
+            m <- comp$models[[mn]]
+
+            # Re-test using treat() on the stored pre-eBayes contrast fit
+            if (lfc > 0 && !is.null(m$cfit)) {
+                treat_fit <- limma::treat(m$cfit, lfc = lfc)
+            } else if (!is.null(m$cfit)) {
+                treat_fit <- limma::eBayes(m$cfit)
+            } else {
+                # Fallback: cfit not available (old compare_voom_models output)
+                treat_fit <- m$efit
+            }
+
+            dt <- limma::decideTests(treat_fit, p.value = fdr, lfc = lfc)
+            n_up   <- sum(dt > 0)
+            n_down <- sum(dt < 0)
+
+            comp$models[[mn]]$de_genes <- rownames(dt)[dt != 0]
+            comp$models[[mn]]$n_de     <- n_up + n_down
+            comp$models[[mn]]$n_up     <- n_up
+            comp$models[[mn]]$n_down   <- n_down
+
+            # Update summary row
+            idx <- which(comp$summary$model == mn)
+            if (length(idx) == 1L) {
+                comp$summary$n_de[idx]   <- n_up + n_down
+                comp$summary$n_up[idx]   <- n_up
+                comp$summary$n_down[idx] <- n_down
+            }
+        }
+
+        # Recompute de_overlap
+        all_de <- unique(unlist(lapply(comp$models, `[[`, "de_genes")))
+        if (length(all_de) > 0L) {
+            de_overlap <- tibble::tibble(gene = all_de)
+            for (mn in model_names) {
+                de_overlap[[mn]] <- all_de %in% comp$models[[mn]]$de_genes
+            }
+        } else {
+            de_overlap <- tibble::tibble(gene = character(0))
+            for (mn in model_names) {
+                de_overlap[[mn]] <- logical(0)
+            }
+        }
+        comp$concordance$de_overlap <- de_overlap
+
+        comparisons[[design_name]] <- comp
+    }
+    comparisons
 }
 
 
