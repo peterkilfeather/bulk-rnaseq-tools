@@ -444,6 +444,20 @@ message("Reason: ", selection$reason)
 ```
 
 
+# Selection diagnostics
+
+A multi-panel diagnostic figure was produced to aid review of the model
+selection process. Panels included an UpSet plot of DE gene overlap across
+designs, a pairs plot of genome-wide logFC consistency, fit quality metrics,
+per-gene RMSE distributions, p-value calibration histograms, and a summary
+of the selection path.
+
+```{r selection-diagnostics, fig.width=14, fig.height=18}
+diag <- plot_selection_diagnostics(comparisons, selection)
+diag$plot
+```
+
+
 # Summary & next steps
 
 The pipeline recommended **`r selection$design`** with

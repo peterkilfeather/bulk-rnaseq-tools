@@ -921,3 +921,343 @@ format_table_row <- function(values, widths) {
     }, character(1))
     paste0("  ", paste(parts, collapse = "  "))
 }
+
+
+# =============================================================================
+# Diagnostic plots for reviewing model selection
+# =============================================================================
+
+#' Diagnostic plots for the select_model() selection process
+#'
+#' Produces a multi-panel figure that helps a reviewer understand why a
+#' particular design was recommended.  Requires at least two designs.
+#'
+#' @param comparisons Named list of \code{compare_voom_models()} outputs
+#'   (same input as \code{select_model()}).
+#' @param selection   Output of \code{select_model()}.
+#' @param plot_file   Optional file path to save the combined plot.
+#'
+#' @return A named list:
+#'   \item{plot}{patchwork object with all panels.}
+#'   \item{panels}{Named list of individual ggplot objects.}
+plot_selection_diagnostics <- function(comparisons, selection,
+                                       plot_file = NULL) {
+
+    comparisons <- validate_comparisons(comparisons)
+    ds <- selection$design_summary
+    if (nrow(ds) < 2L) {
+        stop("plot_selection_diagnostics requires at least 2 designs")
+    }
+
+    design_names <- ds$design
+    winners      <- stats::setNames(ds$winner, ds$design)
+
+    # Extract winning model objects
+    winning_models <- lapply(design_names, function(d) {
+        comparisons[[d]]$models[[winners[d]]]
+    })
+    names(winning_models) <- design_names
+
+    # DE gene lists
+    de_lists <- lapply(winning_models, `[[`, "de_genes")
+
+    # Top tables
+    top_tables <- lapply(winning_models, `[[`, "top_table")
+
+    # -- Build panels ----------------------------------------------------------
+    p_upset  <- build_upset_panel(de_lists, design_names)
+    p_pairs  <- build_pairs_panel(top_tables, design_names)
+    p_fit    <- build_fit_quality_panel(ds, selection$design)
+    p_rmse   <- build_rmse_density_panel(winning_models, design_names,
+                                          selection$design)
+    p_pval   <- build_pvalue_panel(top_tables, design_names)
+    p_path   <- build_selection_path_panel(selection)
+
+    # -- Assemble layout -------------------------------------------------------
+    layout <- "AAAA\nBBCC\nDDEE\nFFFF"
+    p_combined <- patchwork::wrap_plots(
+        A = p_upset, B = p_pairs, C = p_fit,
+        D = p_rmse,  E = p_pval,  F = p_path,
+        design = layout,
+        heights = c(2, 2, 1.5, 0.5)
+    ) + patchwork::plot_annotation(
+        title = "Model Selection Diagnostics",
+        subtitle = paste0("Selected: ", selection$design, " / ",
+                          selection$recommended)
+    )
+
+    if (!is.null(plot_file)) {
+        n_d <- length(design_names)
+        h <- 14 + n_d * 1.5
+        ggplot2::ggsave(plot_file, plot = p_combined, width = 14, height = h)
+        message("Saved diagnostics to ", plot_file)
+    }
+
+    list(
+        plot   = p_combined,
+        panels = list(upset = p_upset, pairs = p_pairs, fit = p_fit,
+                      rmse = p_rmse, pvalue = p_pval, path = p_path)
+    )
+}
+
+
+# -- Panel helpers -------------------------------------------------------------
+
+#' UpSet plot of DE gene overlap (pure ggplot2)
+#' @noRd
+build_upset_panel <- function(de_lists, design_names) {
+    all_genes <- unique(unlist(de_lists))
+
+    if (length(all_genes) == 0L) {
+        return(ggplot2::ggplot() +
+                   ggplot2::annotate("text", x = 0.5, y = 0.5,
+                                     label = "No DE genes in any design") +
+                   ggplot2::theme_void())
+    }
+
+    # Membership matrix: genes x designs
+    membership <- vapply(de_lists, function(dg) all_genes %in% dg,
+                          logical(length(all_genes)))
+
+    # Intersection patterns (use 1/0 for clean split)
+    pattern_keys <- apply(membership, 1, function(row) {
+        paste(as.integer(row), collapse = ",")
+    })
+    pattern_tab  <- sort(table(pattern_keys), decreasing = TRUE)
+
+    # Cap at top 15
+    if (length(pattern_tab) > 15L) pattern_tab <- pattern_tab[1:15]
+    patterns <- names(pattern_tab)
+    counts   <- as.integer(pattern_tab)
+    n_pat    <- length(patterns)
+
+    # Decode patterns
+    pat_matrix <- do.call(rbind, lapply(strsplit(patterns, ","), as.logical))
+    if (n_pat == 1L) pat_matrix <- matrix(pat_matrix, nrow = 1)
+
+    # Intersection IDs (ordered by count)
+    int_ids <- factor(seq_len(n_pat), levels = seq_len(n_pat))
+
+    # -- Top: bar chart --------------------------------------------------------
+    bar_df <- data.frame(int_id = int_ids, count = counts)
+    p_bars <- ggplot2::ggplot(bar_df, ggplot2::aes(x = int_id, y = count)) +
+        ggplot2::geom_col(fill = "#4575B4") +
+        ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.3,
+                           size = 2.5) +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(y = "Intersection\nsize", x = NULL,
+                      title = "DE gene overlap (UpSet)") +
+        ggplot2::theme(
+            axis.text.x  = ggplot2::element_blank(),
+            axis.ticks.x = ggplot2::element_blank(),
+            panel.grid.major.x = ggplot2::element_blank()
+        )
+
+    # -- Bottom: dot matrix ----------------------------------------------------
+    n_designs <- length(design_names)
+    dot_df <- expand.grid(int_id = seq_len(n_pat), design_idx = seq_len(n_designs))
+    dot_df$design <- design_names[dot_df$design_idx]
+    dot_df$active <- vapply(seq_len(nrow(dot_df)), function(i) {
+        pat_matrix[dot_df$int_id[i], dot_df$design_idx[i]]
+    }, logical(1))
+    dot_df$int_id <- factor(dot_df$int_id, levels = seq_len(n_pat))
+    dot_df$design <- factor(dot_df$design, levels = rev(design_names))
+
+    # Segments connecting active dots within each intersection
+    seg_rows <- list()
+    for (p in seq_len(n_pat)) {
+        active_idx <- which(pat_matrix[p, ])
+        if (length(active_idx) >= 2L) {
+            seg_rows[[length(seg_rows) + 1L]] <- data.frame(
+                x = p, ymin = min(active_idx), ymax = max(active_idx))
+        }
+    }
+    seg_df <- if (length(seg_rows) > 0L) do.call(rbind, seg_rows) else NULL
+
+    p_dots <- ggplot2::ggplot(dot_df,
+                              ggplot2::aes(x = int_id,
+                                           y = as.integer(design))) +
+        ggplot2::geom_point(ggplot2::aes(fill = active),
+                            shape = 21, size = 3, color = "grey40") +
+        ggplot2::scale_fill_manual(values = c("TRUE" = "#D73027",
+                                               "FALSE" = "grey90"),
+                                    guide = "none")
+
+    if (!is.null(seg_df)) {
+        p_dots <- p_dots +
+            ggplot2::geom_segment(
+                data = seg_df,
+                ggplot2::aes(x = x, xend = x, y = ymin, yend = ymax),
+                inherit.aes = FALSE, color = "#D73027", linewidth = 0.8)
+    }
+
+    p_dots <- p_dots +
+        ggplot2::scale_y_continuous(
+            breaks = seq_len(n_designs),
+            labels = rev(design_names)) +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(x = NULL, y = NULL) +
+        ggplot2::theme(
+            axis.text.x  = ggplot2::element_blank(),
+            axis.ticks.x = ggplot2::element_blank(),
+            panel.grid.major.x = ggplot2::element_blank()
+        )
+
+    patchwork::wrap_plots(p_bars, p_dots, ncol = 1, heights = c(2, 1))
+}
+
+
+#' LogFC pairs plot
+#' @noRd
+build_pairs_panel <- function(top_tables, design_names) {
+    n <- length(design_names)
+    panels <- vector("list", n * n)
+
+    for (i in seq_len(n)) {
+        for (j in seq_len(n)) {
+            idx <- (i - 1L) * n + j
+            if (i == j) {
+                # Diagonal: density
+                df <- data.frame(logfc = top_tables[[i]]$logFC)
+                panels[[idx]] <- ggplot2::ggplot(df,
+                        ggplot2::aes(x = logfc)) +
+                    ggplot2::geom_density(fill = "#4575B4", alpha = 0.4) +
+                    ggplot2::labs(title = design_names[i], x = NULL,
+                                 y = NULL) +
+                    ggplot2::theme_minimal() +
+                    ggplot2::theme(axis.text = ggplot2::element_blank())
+            } else if (i > j) {
+                # Lower triangle: scatter
+                df <- data.frame(x = top_tables[[j]]$logFC,
+                                 y = top_tables[[i]]$logFC)
+                panels[[idx]] <- ggplot2::ggplot(df,
+                        ggplot2::aes(x = x, y = y)) +
+                    ggplot2::geom_point(size = 0.3, alpha = 0.3,
+                                        color = "grey60") +
+                    ggplot2::geom_abline(slope = 1, intercept = 0,
+                                         linetype = "dashed",
+                                         color = "grey40") +
+                    ggplot2::theme_minimal() +
+                    ggplot2::labs(x = if (i == n) design_names[j] else NULL,
+                                 y = if (j == 1) design_names[i] else NULL) +
+                    ggplot2::theme(axis.text = ggplot2::element_blank())
+            } else {
+                # Upper triangle: correlation
+                r <- stats::cor(top_tables[[i]]$logFC,
+                                top_tables[[j]]$logFC,
+                                method = "pearson")
+                r_col <- grDevices::colorRamp(c("#4575B4", "#D73027"))(
+                    min(1, abs(r)))
+                r_hex <- grDevices::rgb(r_col[1], r_col[2], r_col[3],
+                                        maxColorValue = 255)
+                r_size <- 3 + abs(r) * 5
+                panels[[idx]] <- ggplot2::ggplot() +
+                    ggplot2::annotate("text", x = 0.5, y = 0.5,
+                                     label = sprintf("r = %.3f", r),
+                                     size = r_size, color = r_hex) +
+                    ggplot2::xlim(0, 1) + ggplot2::ylim(0, 1) +
+                    ggplot2::theme_void()
+            }
+        }
+    }
+
+    patchwork::wrap_plots(panels, ncol = n) +
+        patchwork::plot_annotation(title = "LogFC pairs (winning models)")
+}
+
+
+#' Fit quality bar chart (RMSE and R-squared)
+#' @noRd
+build_fit_quality_panel <- function(design_summary, selected_design) {
+    ds <- design_summary
+    ds$is_selected <- ds$design == selected_design
+
+    # Long format for faceting
+    rmse_df <- data.frame(design = ds$design, value = ds$median_rmse,
+                          metric = "Median RMSE",
+                          is_selected = ds$is_selected,
+                          stringsAsFactors = FALSE)
+    r2_df   <- data.frame(design = ds$design, value = ds$median_r_squared,
+                          metric = "Median R\u00b2",
+                          is_selected = ds$is_selected,
+                          stringsAsFactors = FALSE)
+    long_df <- rbind(rmse_df, r2_df)
+    long_df$design <- factor(long_df$design, levels = ds$design)
+
+    ggplot2::ggplot(long_df, ggplot2::aes(x = design, y = value)) +
+        ggplot2::geom_col(ggplot2::aes(color = is_selected),
+                          fill = "#4575B4", linewidth = 0.8) +
+        ggplot2::scale_color_manual(values = c("TRUE" = "#D73027",
+                                                "FALSE" = NA),
+                                     guide = "none") +
+        ggplot2::facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(x = NULL, y = NULL, title = "Fit quality") +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 30,
+                                                            hjust = 1))
+}
+
+
+#' Per-gene RMSE density overlay
+#' @noRd
+build_rmse_density_panel <- function(winning_models, design_names,
+                                      selected_design) {
+    rows <- lapply(design_names, function(d) {
+        data.frame(design = d, rmse = winning_models[[d]]$rmse,
+                   stringsAsFactors = FALSE)
+    })
+    df <- do.call(rbind, rows)
+    df$design <- factor(df$design, levels = design_names)
+    df$is_selected <- df$design == selected_design
+
+    ggplot2::ggplot(df, ggplot2::aes(x = rmse, color = design,
+                                      linewidth = is_selected)) +
+        ggplot2::geom_density() +
+        ggplot2::scale_linewidth_manual(values = c("TRUE" = 1.2,
+                                                     "FALSE" = 0.5),
+                                          guide = "none") +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(title = "Per-gene RMSE", x = "RMSE", y = "Density")
+}
+
+
+#' P-value histograms
+#' @noRd
+build_pvalue_panel <- function(top_tables, design_names) {
+    rows <- lapply(design_names, function(d) {
+        data.frame(design = d, pvalue = top_tables[[d]]$P.Value,
+                   stringsAsFactors = FALSE)
+    })
+    df <- do.call(rbind, rows)
+    df$design <- factor(df$design, levels = design_names)
+
+    n_genes <- nrow(top_tables[[1]])
+    uniform_height <- n_genes / 50  # 50 bins
+
+    ggplot2::ggplot(df, ggplot2::aes(x = pvalue)) +
+        ggplot2::geom_histogram(bins = 50, fill = "#4575B4",
+                                color = "white", linewidth = 0.2) +
+        ggplot2::geom_hline(yintercept = uniform_height,
+                            linetype = "dashed", color = "#D73027") +
+        ggplot2::facet_wrap(~ design) +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(title = "P-value distribution", x = "P-value",
+                      y = "Count")
+}
+
+
+#' Selection path annotation panel
+#' @noRd
+build_selection_path_panel <- function(selection) {
+    lines <- c(
+        paste0("Selected: ", selection$design, " / ", selection$recommended),
+        paste0("Reason: ", selection$reason)
+    )
+    label <- paste(lines, collapse = "\n")
+
+    ggplot2::ggplot() +
+        ggplot2::annotate("text", x = 0, y = 0.5, label = label,
+                          hjust = 0, size = 3.5, fontface = "italic") +
+        ggplot2::xlim(-0.05, 1) + ggplot2::ylim(0, 1) +
+        ggplot2::theme_void()
+}
