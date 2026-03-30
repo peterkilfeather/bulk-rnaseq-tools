@@ -1003,7 +1003,7 @@ plot_selection_diagnostics <- function(comparisons, selection,
 
 # -- Panel helpers -------------------------------------------------------------
 
-#' UpSet plot of DE gene overlap (pure ggplot2)
+#' UpSet plot of DE gene overlap via UpSetR
 #' @noRd
 build_upset_panel <- function(de_lists, design_names) {
     all_genes <- unique(unlist(de_lists))
@@ -1015,95 +1015,31 @@ build_upset_panel <- function(de_lists, design_names) {
                    ggplot2::theme_void())
     }
 
-    # Membership matrix: genes x designs
-    membership <- vapply(de_lists, function(dg) all_genes %in% dg,
-                          logical(length(all_genes)))
-
-    # Intersection patterns (use 1/0 for clean split)
-    pattern_keys <- apply(membership, 1, function(row) {
-        paste(as.integer(row), collapse = ",")
-    })
-    pattern_tab  <- sort(table(pattern_keys), decreasing = TRUE)
-
-    # Cap at top 15
-    if (length(pattern_tab) > 15L) pattern_tab <- pattern_tab[1:15]
-    patterns <- names(pattern_tab)
-    counts   <- as.integer(pattern_tab)
-    n_pat    <- length(patterns)
-
-    # Decode patterns
-    pat_matrix <- do.call(rbind, lapply(strsplit(patterns, ","), as.logical))
-    if (n_pat == 1L) pat_matrix <- matrix(pat_matrix, nrow = 1)
-
-    # Intersection IDs (ordered by count)
-    int_ids <- factor(seq_len(n_pat), levels = seq_len(n_pat))
-
-    # -- Top: bar chart --------------------------------------------------------
-    bar_df <- data.frame(int_id = int_ids, count = counts)
-    p_bars <- ggplot2::ggplot(bar_df, ggplot2::aes(x = int_id, y = count)) +
-        ggplot2::geom_col(fill = "#4575B4") +
-        ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.3,
-                           size = 2.5) +
-        ggplot2::theme_minimal() +
-        ggplot2::labs(y = "Intersection\nsize", x = NULL,
-                      title = "DE gene overlap (UpSet)") +
-        ggplot2::theme(
-            axis.text.x  = ggplot2::element_blank(),
-            axis.ticks.x = ggplot2::element_blank(),
-            panel.grid.major.x = ggplot2::element_blank()
-        )
-
-    # -- Bottom: dot matrix ----------------------------------------------------
-    n_designs <- length(design_names)
-    dot_df <- expand.grid(int_id = seq_len(n_pat), design_idx = seq_len(n_designs))
-    dot_df$design <- design_names[dot_df$design_idx]
-    dot_df$active <- vapply(seq_len(nrow(dot_df)), function(i) {
-        pat_matrix[dot_df$int_id[i], dot_df$design_idx[i]]
-    }, logical(1))
-    dot_df$int_id <- factor(dot_df$int_id, levels = seq_len(n_pat))
-    dot_df$design <- factor(dot_df$design, levels = rev(design_names))
-
-    # Segments connecting active dots within each intersection
-    seg_rows <- list()
-    for (p in seq_len(n_pat)) {
-        active_idx <- which(pat_matrix[p, ])
-        if (length(active_idx) >= 2L) {
-            seg_rows[[length(seg_rows) + 1L]] <- data.frame(
-                x = p, ymin = min(active_idx), ymax = max(active_idx))
-        }
-    }
-    seg_df <- if (length(seg_rows) > 0L) do.call(rbind, seg_rows) else NULL
-
-    p_dots <- ggplot2::ggplot(dot_df,
-                              ggplot2::aes(x = int_id,
-                                           y = as.integer(design))) +
-        ggplot2::geom_point(ggplot2::aes(fill = active),
-                            shape = 21, size = 3, color = "grey40") +
-        ggplot2::scale_fill_manual(values = c("TRUE" = "#D73027",
-                                               "FALSE" = "grey90"),
-                                    guide = "none")
-
-    if (!is.null(seg_df)) {
-        p_dots <- p_dots +
-            ggplot2::geom_segment(
-                data = seg_df,
-                ggplot2::aes(x = x, xend = x, y = ymin, yend = ymax),
-                inherit.aes = FALSE, color = "#D73027", linewidth = 0.8)
+    # Build binary membership data.frame (UpSetR input format)
+    upset_df <- data.frame(row.names = all_genes)
+    for (i in seq_along(design_names)) {
+        upset_df[[design_names[i]]] <- as.integer(all_genes %in% de_lists[[i]])
     }
 
-    p_dots <- p_dots +
-        ggplot2::scale_y_continuous(
-            breaks = seq_len(n_designs),
-            labels = rev(design_names)) +
-        ggplot2::theme_minimal() +
-        ggplot2::labs(x = NULL, y = NULL) +
-        ggplot2::theme(
-            axis.text.x  = ggplot2::element_blank(),
-            axis.ticks.x = ggplot2::element_blank(),
-            panel.grid.major.x = ggplot2::element_blank()
-        )
+    # Capture UpSetR plot as a grob for patchwork integration
+    grob <- gridExtra::arrangeGrob(grobs = list(
+        grid::grid.grabExpr(wrap.grobs = TRUE, print(
+            UpSetR::upset(upset_df,
+                          sets            = rev(design_names),
+                          keep.order      = TRUE,
+                          order.by        = "freq",
+                          main.bar.color  = "#4575B4",
+                          sets.bar.color  = "#4575B4",
+                          matrix.color    = "#D73027",
+                          point.size      = 2.5,
+                          line.size       = 0.8,
+                          show.numbers    = "yes",
+                          text.scale      = c(1.3, 1, 1, 1, 1.2, 1),
+                          set_size.show   = TRUE)
+        ))
+    ))
 
-    patchwork::wrap_plots(p_bars, p_dots, ncol = 1, heights = c(2, 1))
+    patchwork::wrap_elements(grob)
 }
 
 
