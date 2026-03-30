@@ -685,7 +685,11 @@ pick_best_design <- function(design_winners, comparisons = NULL,
             if (ref_ok) {
                 selected_idx <- k
                 refined <- TRUE
-                break
+                # Update baseline for further refinement
+                cur_winner <- ref_winner
+                cur_rmse   <- rmses[k]
+                cur_n_de   <- ref_n_de
+                cur_model  <- ref_model
             }
         }
     }
