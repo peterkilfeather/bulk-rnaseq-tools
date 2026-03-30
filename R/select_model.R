@@ -84,11 +84,12 @@ select_model <- function(comparisons, verbose = TRUE) {
 
     # -- Return ----------------------------------------------------------------
     list(
-        recommended    = best$winner,
-        design         = best$design,
-        reason         = reason,
-        model          = comparisons[[best$design]]$models[[best$winner]],
-        design_summary = design_summary
+        recommended      = best$winner,
+        design           = best$design,
+        reason           = reason,
+        model            = comparisons[[best$design]]$models[[best$winner]],
+        design_summary   = design_summary,
+        concordance_plot = design_winners[[best$design]]$concordance_plot
     )
 }
 
@@ -144,9 +145,10 @@ pick_voom_strategy <- function(comp, design_name, verbose = TRUE) {
         }
 
         return(list(
-            winner     = winner_name,
-            winner_row = winner_row,
-            summary    = summ
+            winner           = winner_name,
+            winner_row       = winner_row,
+            summary          = summ,
+            concordance_plot = NULL
         ))
     }
 
@@ -189,16 +191,78 @@ pick_voom_strategy <- function(comp, design_name, verbose = TRUE) {
     }
 
     negligible_pct <- 1.0  # differences below 1% are essentially tied
+    concordance_evaluated <- FALSE
+    concordance_plot <- NULL
 
     # Decision logic — magnitude-aware
     if (rmse_winner == r2_winner && rmse_winner != "tied") {
         winner_name <- rmse_winner
         decision_reason <- "both metrics agree"
     } else if (rmse_rel_pct < negligible_pct && r2_rel_pct < negligible_pct) {
-        winner_name <- m1$model
-        decision_reason <- sprintf(
-            "metrics disagree but both differences negligible (<%.0f%%); preferring simpler model",
-            negligible_pct)
+        # Fit metrics are comparable — check if DE gene counts diverge
+        concordance_evaluated <- TRUE
+        m1_name <- m1$model
+        m2_name <- m2$model
+
+        if (m2$n_de > m1$n_de) {
+            more_de_model  <- m2_name
+            fewer_de_model <- m1_name
+            more_de_n      <- m2$n_de
+            fewer_de_n     <- m1$n_de
+        } else {
+            more_de_model  <- m1_name
+            fewer_de_model <- m2_name
+            more_de_n      <- m1$n_de
+            fewer_de_n     <- m2$n_de
+        }
+
+        conc <- check_concordance_power(
+            comp           = comp,
+            fewer_model    = fewer_de_model,
+            more_model     = more_de_model,
+            fewer_n_de     = fewer_de_n,
+            more_n_de      = more_de_n,
+            fewer_prior_df = blocked[blocked$model == fewer_de_model, ]$prior_df,
+            more_prior_df  = blocked[blocked$model == more_de_model, ]$prior_df
+        )
+
+        if (conc$trustworthy) {
+            winner_name <- more_de_model
+            decision_reason <- sprintf(
+                paste0("fit comparable (<%.0f%%); %s finds more DE genes ",
+                       "(%d vs %d) with good concordance; %s"),
+                negligible_pct, more_de_model, more_de_n, fewer_de_n,
+                conc$detail)
+        } else {
+            winner_name <- m1$model
+            decision_reason <- sprintf(
+                paste0("fit comparable (<%.0f%%); %s"),
+                negligible_pct, conc$detail)
+        }
+
+        if (verbose && conc$substantial) {
+            message("\n  Concordance diagnostics (comparable fit, DE gene check):")
+            message(sprintf("    DE genes: %s=%d, %s=%d (ratio: %.1fx)",
+                            fewer_de_model, fewer_de_n,
+                            more_de_model, more_de_n,
+                            more_de_n / max(fewer_de_n, 1L)))
+            message(sprintf("    Subset overlap: %.0f%% of %s DE genes in %s",
+                            conc$subset_frac * 100,
+                            fewer_de_model, more_de_model))
+            message(sprintf("    LogFC correlation: %.4f", conc$logfc_cor))
+            message(sprintf("    Prior df ratio (%s/%s): %.2f",
+                            more_de_model, fewer_de_model,
+                            conc$prior_df_ratio))
+            message(sprintf("    Verdict: %s",
+                            if (conc$trustworthy) "power gain supported"
+                            else "insufficient concordance"))
+        }
+
+        # Build concordance diagnostic plot when DE counts diverge substantially
+        if (conc$substantial) {
+            concordance_plot <- build_concordance_plot(
+                comp, fewer_de_model, more_de_model, conc)
+        }
     } else if (rmse_winner != "tied" && r2_winner != "tied" &&
                rmse_winner != r2_winner) {
         # Disagree — whichever metric has the larger relative difference wins
@@ -232,15 +296,18 @@ pick_voom_strategy <- function(comp, design_name, verbose = TRUE) {
     winner_row <- blocked[blocked$model == winner_name, ]
 
     # Suspicious pattern: worse fit but more DE genes
-    loser_name <- setdiff(c(m1$model, m2$model), winner_name)
-    loser_row  <- blocked[blocked$model == loser_name, ]
-    if (nrow(loser_row) == 1L && loser_row$n_de > winner_row$n_de &&
-        loser_row$median_rmse > winner_row$median_rmse) {
-        warning("Design '", design_name, "': ", loser_name,
-                " has worse fit (higher RMSE) but more DE genes (",
-                loser_row$n_de, " vs ", winner_row$n_de,
-                "). This may indicate spurious discoveries.",
-                call. = FALSE)
+    # (skip when concordance was already evaluated for this scenario)
+    if (!concordance_evaluated) {
+        loser_name <- setdiff(c(m1$model, m2$model), winner_name)
+        loser_row  <- blocked[blocked$model == loser_name, ]
+        if (nrow(loser_row) == 1L && loser_row$n_de > winner_row$n_de &&
+            loser_row$median_rmse > winner_row$median_rmse) {
+            warning("Design '", design_name, "': ", loser_name,
+                    " has worse fit (higher RMSE) but more DE genes (",
+                    loser_row$n_de, " vs ", winner_row$n_de,
+                    "). This may indicate spurious discoveries.",
+                    call. = FALSE)
+        }
     }
 
     # Verbose output
@@ -249,10 +316,171 @@ pick_voom_strategy <- function(comp, design_name, verbose = TRUE) {
     }
 
     list(
-        winner     = winner_name,
-        winner_row = winner_row,
-        summary    = summ
+        winner           = winner_name,
+        winner_row       = winner_row,
+        summary          = summ,
+        concordance_plot = concordance_plot
     )
+}
+
+
+#' Check whether a model with more DE genes represents a trustworthy power gain
+#' @noRd
+check_concordance_power <- function(comp, fewer_model, more_model,
+                                     fewer_n_de, more_n_de,
+                                     fewer_prior_df, more_prior_df) {
+
+    de_ratio <- more_n_de / max(fewer_n_de, 1L)
+
+    # Gate: DE gene difference not substantial enough to evaluate
+    if (de_ratio < 1.5) {
+        return(list(
+            trustworthy    = FALSE,
+            substantial    = FALSE,
+            subset_frac    = NA_real_,
+            logfc_cor      = NA_real_,
+            prior_df_ratio = NA_real_,
+            detail         = sprintf(
+                "DE ratio %.1fx (< 1.5x threshold); difference not substantial",
+                de_ratio)
+        ))
+    }
+
+    # Subset fraction: what fraction of the fewer model's DE genes are in the
+    # more model's DE set?
+    de_overlap <- comp$concordance$de_overlap
+    if (fewer_n_de > 0L && nrow(de_overlap) > 0L) {
+        n_in_fewer <- sum(de_overlap[[fewer_model]])
+        n_both     <- sum(de_overlap[[fewer_model]] & de_overlap[[more_model]])
+        subset_frac <- n_both / n_in_fewer
+    } else {
+        subset_frac <- 1.0  # vacuously true when fewer model finds nothing
+    }
+
+    # LogFC correlation (genome-wide, already computed)
+    logfc_cor_val <- comp$concordance$logfc_cor[fewer_model, more_model]
+
+    # Prior df ratio
+    prior_df_ratio <- more_prior_df / fewer_prior_df
+
+    # Thresholds
+    subset_ok   <- subset_frac >= 0.80
+    logfc_ok    <- !is.na(logfc_cor_val) && logfc_cor_val >= 0.95
+    prior_df_ok <- prior_df_ratio >= 0.5
+
+    trustworthy <- subset_ok && logfc_ok && prior_df_ok
+
+    # Build detail string
+    checks <- c(
+        sprintf("subset=%.0f%%%s", subset_frac * 100,
+                if (subset_ok) "" else " [FAIL]"),
+        sprintf("logFC_cor=%.3f%s", logfc_cor_val,
+                if (logfc_ok) "" else " [FAIL]"),
+        sprintf("prior_df_ratio=%.2f%s", prior_df_ratio,
+                if (prior_df_ok) "" else " [FAIL]")
+    )
+    verdict <- if (trustworthy) "power gain supported" else "insufficient concordance"
+    detail <- paste0(paste(checks, collapse = ", "), " -> ", verdict)
+
+    list(
+        trustworthy    = trustworthy,
+        substantial    = TRUE,
+        subset_frac    = subset_frac,
+        logfc_cor      = logfc_cor_val,
+        prior_df_ratio = prior_df_ratio,
+        detail         = detail
+    )
+}
+
+
+#' Build concordance diagnostic plot (logFC scatter + DE overlap bar)
+#' @noRd
+build_concordance_plot <- function(comp, fewer_model, more_model, conc) {
+    fewer_top <- comp$models[[fewer_model]]$top_table
+    more_top  <- comp$models[[more_model]]$top_table
+    fewer_de  <- comp$models[[fewer_model]]$de_genes
+    more_de   <- comp$models[[more_model]]$de_genes
+
+    genes <- rownames(fewer_top)
+
+    # -- Panel A: LogFC scatter with DE membership colouring -------------------
+    de_status <- ifelse(
+        genes %in% fewer_de & genes %in% more_de, "Both",
+        ifelse(genes %in% fewer_de, fewer_model,
+               ifelse(genes %in% more_de, more_model, "Neither")))
+
+    scatter_df <- data.frame(
+        logfc_fewer = fewer_top$logFC,
+        logfc_more  = more_top$logFC,
+        de_status   = de_status,
+        stringsAsFactors = FALSE
+    )
+    # Plot non-DE genes first, DE genes on top
+    scatter_df$de_status <- factor(scatter_df$de_status,
+        levels = c("Neither", fewer_model, more_model, "Both"))
+    scatter_df <- scatter_df[order(scatter_df$de_status), ]
+
+    pa <- ggplot2::ggplot(scatter_df,
+                          ggplot2::aes(x = logfc_fewer, y = logfc_more,
+                                       color = de_status)) +
+        ggplot2::geom_point(size = 0.5, alpha = 0.4) +
+        ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                             color = "grey40") +
+        ggplot2::scale_color_manual(
+            values = c(Neither = "grey80",
+                       stats::setNames("#4575B4", fewer_model),
+                       stats::setNames("#FDB863", more_model),
+                       Both = "#D73027"),
+            drop = FALSE
+        ) +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(
+            title = "LogFC concordance",
+            x = paste("logFC \u2014", fewer_model),
+            y = paste("logFC \u2014", more_model),
+            color = "DE in"
+        )
+
+    # -- Panel B: DE overlap bar chart -----------------------------------------
+    n_both       <- sum(genes %in% fewer_de & genes %in% more_de)
+    n_only_fewer <- sum(genes %in% fewer_de & !(genes %in% more_de))
+    n_only_more  <- sum(!(genes %in% fewer_de) & genes %in% more_de)
+
+    bar_df <- data.frame(
+        category = c("Shared", paste("Only", fewer_model),
+                     paste("Only", more_model)),
+        count    = c(n_both, n_only_fewer, n_only_more),
+        stringsAsFactors = FALSE
+    )
+    bar_df$category <- factor(bar_df$category, levels = bar_df$category)
+
+    subset_label <- if (!is.na(conc$subset_frac)) {
+        sprintf("Subset overlap: %.0f%%", conc$subset_frac * 100)
+    } else {
+        ""
+    }
+
+    pb <- ggplot2::ggplot(bar_df, ggplot2::aes(x = category, y = count,
+                                                fill = category)) +
+        ggplot2::geom_col(show.legend = FALSE) +
+        ggplot2::scale_fill_manual(
+            values = c(Shared = "#D73027",
+                       stats::setNames("#4575B4",
+                                       paste("Only", fewer_model)),
+                       stats::setNames("#FDB863",
+                                       paste("Only", more_model)))
+        ) +
+        ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.3,
+                           size = 3.5) +
+        ggplot2::annotate("text", x = 2, y = max(bar_df$count) * 0.9,
+                          label = subset_label, size = 3.5,
+                          fontface = "italic") +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(title = "DE gene overlap", x = NULL, y = "Genes") +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 30,
+                                                            hjust = 1))
+
+    patchwork::wrap_plots(pa, pb, ncol = 2, widths = c(1.5, 1))
 }
 
 
