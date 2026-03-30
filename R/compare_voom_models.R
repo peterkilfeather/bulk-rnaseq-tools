@@ -49,9 +49,19 @@ compare_voom_models <- function(dge, design, contrast, block,
         contrast_mat <- tryCatch(
             limma::makeContrasts(contrasts = contrast, levels = design),
             error = function(e) {
+                avail <- colnames(design)
+                cmap  <- attr(design, "colname_map")
+                hint  <- if (length(cmap) > 0L) {
+                    paste0("\nNote: some column names were sanitized. ",
+                           "Original names: ",
+                           paste(cmap, collapse = ", "))
+                } else {
+                    ""
+                }
                 stop("Failed to build contrast from '", contrast,
                      "'. Available coefficients: ",
-                     paste(colnames(design), collapse = ", "),
+                     paste(avail, collapse = ", "),
+                     hint,
                      "\nOriginal error: ", e$message, call. = FALSE)
             }
         )

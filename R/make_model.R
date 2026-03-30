@@ -23,6 +23,11 @@
 #'   \item{sample_weights_flag}{FALSE (no PCA data to assess).}
 #'   \item{sample_weights_vars}{Empty character vector.}
 #'
+#'   Within each model specification:
+#'   \item{colname_map}{Named character vector mapping sanitized column names
+#'         (names) to original \code{model.matrix()} column names (values).
+#'         Empty when no renaming was needed.}
+#'
 #' @export
 make_model <- function(formula, metadata, block, name = "custom",
                        drop_redundant = FALSE) {
@@ -96,6 +101,25 @@ make_model <- function(formula, metadata, block, name = "custom",
         }
     }
 
+    # -- Sanitize non-syntactic column names ------------------------------------
+    original_colnames <- colnames(design)
+    clean_colnames    <- make.names(original_colnames, unique = TRUE)
+    renamed           <- original_colnames != clean_colnames
+
+    if (any(renamed)) {
+        colname_map <- stats::setNames(original_colnames[renamed],
+                                       clean_colnames[renamed])
+        colnames(design) <- clean_colnames
+        attr(design, "colname_map") <- colname_map
+        message("Sanitized ", sum(renamed), " design matrix column name(s) ",
+                "for compatibility with limma::makeContrasts():")
+        for (i in which(renamed)) {
+            message("  '", original_colnames[i], "' -> '", clean_colnames[i], "'")
+        }
+    } else {
+        colname_map <- character(0)
+    }
+
     # -- Identify covariates (formula terms beyond base) -----------------------
     covariates <- formula_vars
 
@@ -108,10 +132,11 @@ make_model <- function(formula, metadata, block, name = "custom",
         covariate_ranking   = NULL,
         models              = list(
             list(
-                name       = name,
-                formula    = formula,
-                design     = design,
-                covariates = covariates
+                name        = name,
+                formula     = formula,
+                design      = design,
+                covariates  = covariates,
+                colname_map = colname_map
             )
         ),
         skipped_covariates  = tibble::tibble(
