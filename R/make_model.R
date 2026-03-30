@@ -10,6 +10,10 @@
 #' @param block     Character; blocking variable column name (required because
 #'                  the experiment has repeated measures).
 #' @param name      Character; label for the model (default \code{"custom"}).
+#' @param drop_redundant Logical; if \code{TRUE}, automatically drop
+#'   non-estimable (collinear) columns from a rank-deficient design matrix with
+#'   a warning.  If \code{FALSE} (default), stop with an error that names the
+#'   redundant column(s).
 #'
 #' @return A named list matching the \code{suggest_models()} output structure:
 #'   \item{covariate_ranking}{NULL (no PCA ranking performed).}
@@ -20,7 +24,8 @@
 #'   \item{sample_weights_vars}{Empty character vector.}
 #'
 #' @export
-make_model <- function(formula, metadata, block, name = "custom") {
+make_model <- function(formula, metadata, block, name = "custom",
+                       drop_redundant = FALSE) {
 
     # -- Input validation ------------------------------------------------------
     if (!inherits(formula, "formula")) {
@@ -43,6 +48,10 @@ make_model <- function(formula, metadata, block, name = "custom") {
 
     if (!is.character(name) || length(name) != 1L) {
         stop("`name` must be a single character string")
+    }
+
+    if (!is.logical(drop_redundant) || length(drop_redundant) != 1L) {
+        stop("`drop_redundant` must be TRUE or FALSE")
     }
 
     # Check formula variables exist in metadata
@@ -70,8 +79,21 @@ make_model <- function(formula, metadata, block, name = "custom") {
 
     design_rank <- qr(design)$rank
     if (design_rank < ncol(design)) {
-        stop("Design matrix is rank deficient (rank ", design_rank,
-             " < ", ncol(design), " columns)")
+        redundant <- limma::nonEstimable(design)
+        if (drop_redundant) {
+            warning("Design matrix is rank deficient (rank ", design_rank,
+                    " < ", ncol(design), " columns). ",
+                    "Dropping non-estimable column(s): ",
+                    paste(redundant, collapse = ", "))
+            design <- design[, !colnames(design) %in% redundant, drop = FALSE]
+        } else {
+            stop("Design matrix is rank deficient (rank ", design_rank,
+                 " < ", ncol(design), " columns). ",
+                 "Non-estimable coefficient(s): ",
+                 paste(redundant, collapse = ", "),
+                 ". Consider removing the corresponding term(s) from your formula, ",
+                 "or set drop_redundant = TRUE to drop them automatically.")
+        }
     }
 
     # -- Identify covariates (formula terms beyond base) -----------------------
