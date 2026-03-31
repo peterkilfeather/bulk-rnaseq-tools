@@ -116,7 +116,9 @@ select_model <- function(comparisons, lfc_threshold = 0,
         reason           = reason,
         model            = comparisons[[best$design]]$models[[best$winner]],
         design_summary   = design_summary,
-        concordance_plot = conc_plot
+        concordance_plot = conc_plot,
+        lfc_threshold    = lfc_threshold,
+        fdr_threshold    = fdr_threshold
     )
 }
 
@@ -173,6 +175,16 @@ rethreshold_models <- function(comparisons, fdr, lfc) {
                 n_up   <- sum(dt > 0)
                 n_down <- sum(dt < 0)
                 de_genes <- rownames(dt)[dt != 0]
+
+                # When treat() changed the statistical test, update efit and
+                # top_table so p-value histograms reflect treat p-values.
+                # Skip when lfc=0 (eBayes result matches the original).
+                if (lfc > 0) {
+                    comp$models[[mn]]$efit      <- treat_fit
+                    comp$models[[mn]]$top_table <- limma::topTable(
+                        treat_fit, number = Inf, sort.by = "none"
+                    )
+                }
             } else {
                 # Fallback: cfit not stored (pre-existing models) — post-hoc
                 # filter on top_table.  This is NOT a formal treat() test.
@@ -1041,6 +1053,19 @@ plot_selection_diagnostics <- function(comparisons, selection,
                                        plot_file = NULL) {
 
     comparisons <- validate_comparisons(comparisons)
+
+    # Re-threshold comparisons to match what select_model() used.
+    # select_model() discards its re-thresholded copy to avoid doubling
+    # memory; re-running here is fast (treat + decideTests on stored cfit).
+    lfc_threshold <- if (is.null(selection$lfc_threshold)) 0
+                     else selection$lfc_threshold
+    fdr_threshold <- if (is.null(selection$fdr_threshold)) 0.05
+                     else selection$fdr_threshold
+    if (lfc_threshold > 0 || fdr_threshold != 0.05) {
+        comparisons <- rethreshold_models(comparisons, fdr_threshold,
+                                           lfc_threshold)
+    }
+
     ds <- selection$design_summary
     if (nrow(ds) < 2L) {
         stop("plot_selection_diagnostics requires at least 2 designs")
@@ -1062,13 +1087,14 @@ plot_selection_diagnostics <- function(comparisons, selection,
     top_tables <- lapply(winning_models, `[[`, "top_table")
 
     # -- Build panels ----------------------------------------------------------
-    p_upset  <- build_upset_panel(de_lists, design_names)
-    p_pairs  <- build_pairs_panel(top_tables, design_names)
+    p_upset  <- build_upset_panel(de_lists, design_names, lfc_threshold)
+    p_pairs  <- build_pairs_panel(top_tables, design_names, lfc_threshold)
     p_fit    <- build_fit_quality_panel(ds, selection$design)
     p_rmse   <- build_rmse_density_panel(winning_models, design_names,
                                           selection$design)
-    p_pval   <- build_pvalue_panel(top_tables, design_names)
-    p_path   <- build_selection_path_panel(selection)
+    p_pval   <- build_pvalue_panel(top_tables, design_names, lfc_threshold)
+    p_path   <- build_selection_path_panel(selection, lfc_threshold,
+                                              fdr_threshold)
 
     # -- Assemble layout -------------------------------------------------------
     layout <- "AAAA\nBBCC\nDDEE\nFFFF"
@@ -1079,8 +1105,13 @@ plot_selection_diagnostics <- function(comparisons, selection,
         heights = c(2, 2, 1.5, 0.5)
     ) + patchwork::plot_annotation(
         title = "Model Selection Diagnostics",
-        subtitle = paste0("Selected: ", selection$design, " / ",
-                          selection$recommended)
+        subtitle = paste0(
+            "Selected: ", selection$design, " / ", selection$recommended,
+            if (lfc_threshold > 0)
+                paste0("  |  |logFC| > ", round(lfc_threshold, 2),
+                       " (treat), FDR < ", fdr_threshold)
+            else ""
+        )
     )
 
     if (!is.null(plot_file)) {
@@ -1102,13 +1133,19 @@ plot_selection_diagnostics <- function(comparisons, selection,
 
 #' UpSet plot of DE gene overlap via UpSetR
 #' @noRd
-build_upset_panel <- function(de_lists, design_names) {
+build_upset_panel <- function(de_lists, design_names, lfc_threshold = 0) {
     all_genes <- unique(unlist(de_lists))
+
+    no_de_label <- "No DE genes in any design"
+    if (lfc_threshold > 0) {
+        no_de_label <- paste0(no_de_label,
+                              " (|logFC| > ", round(lfc_threshold, 2), ")")
+    }
 
     if (length(all_genes) == 0L) {
         return(ggplot2::ggplot() +
                    ggplot2::annotate("text", x = 0.5, y = 0.5,
-                                     label = "No DE genes in any design") +
+                                     label = no_de_label) +
                    ggplot2::theme_void())
     }
 
@@ -1119,22 +1156,31 @@ build_upset_panel <- function(de_lists, design_names) {
     }
 
     # Capture UpSetR plot as a grob for patchwork integration
-    grob <- gridExtra::arrangeGrob(grobs = list(
-        grid::grid.grabExpr(wrap.grobs = TRUE, print(
-            UpSetR::upset(upset_df,
-                          sets            = rev(design_names),
-                          keep.order      = TRUE,
-                          order.by        = "freq",
-                          main.bar.color  = "#4575B4",
-                          sets.bar.color  = "#4575B4",
-                          matrix.color    = "#D73027",
-                          point.size      = 2.5,
-                          line.size       = 0.8,
-                          show.numbers    = "yes",
-                          text.scale      = c(1.3, 1, 1, 1, 1.2, 1),
-                          set_size.show   = TRUE)
-        ))
+    upset_grob <- grid::grid.grabExpr(wrap.grobs = TRUE, print(
+        UpSetR::upset(upset_df,
+                      sets            = rev(design_names),
+                      keep.order      = TRUE,
+                      order.by        = "freq",
+                      main.bar.color  = "#4575B4",
+                      sets.bar.color  = "#4575B4",
+                      matrix.color    = "#D73027",
+                      point.size      = 2.5,
+                      line.size       = 0.8,
+                      show.numbers    = "yes",
+                      text.scale      = c(1.3, 1, 1, 1, 1.2, 1),
+                      set_size.show   = TRUE)
     ))
+
+    if (lfc_threshold > 0) {
+        title_grob <- grid::textGrob(
+            paste0("DE gene overlap  (|logFC| > ",
+                   round(lfc_threshold, 2), ", treat)"),
+            gp = grid::gpar(fontsize = 11, fontface = "bold"))
+        grob <- gridExtra::arrangeGrob(title_grob, upset_grob,
+                                        nrow = 2, heights = c(0.06, 0.94))
+    } else {
+        grob <- gridExtra::arrangeGrob(grobs = list(upset_grob))
+    }
 
     patchwork::wrap_elements(grob)
 }
@@ -1142,7 +1188,7 @@ build_upset_panel <- function(de_lists, design_names) {
 
 #' LogFC pairs plot
 #' @noRd
-build_pairs_panel <- function(top_tables, design_names) {
+build_pairs_panel <- function(top_tables, design_names, lfc_threshold = 0) {
     n <- length(design_names)
     panels <- vector("list", n * n)
 
@@ -1159,6 +1205,13 @@ build_pairs_panel <- function(top_tables, design_names) {
                                  y = NULL) +
                     ggplot2::theme_minimal() +
                     ggplot2::theme(axis.text = ggplot2::element_blank())
+                if (lfc_threshold > 0) {
+                    panels[[idx]] <- panels[[idx]] +
+                        ggplot2::geom_vline(
+                            xintercept = c(-lfc_threshold, lfc_threshold),
+                            linetype = "dotted", color = "#D73027",
+                            linewidth = 0.4)
+                }
             } else if (i > j) {
                 # Lower triangle: scatter
                 df <- data.frame(x = top_tables[[j]]$logFC,
@@ -1174,6 +1227,17 @@ build_pairs_panel <- function(top_tables, design_names) {
                     ggplot2::labs(x = if (i == n) design_names[j] else NULL,
                                  y = if (j == 1) design_names[i] else NULL) +
                     ggplot2::theme(axis.text = ggplot2::element_blank())
+                if (lfc_threshold > 0) {
+                    panels[[idx]] <- panels[[idx]] +
+                        ggplot2::geom_vline(
+                            xintercept = c(-lfc_threshold, lfc_threshold),
+                            linetype = "dotted", color = "#D73027",
+                            linewidth = 0.4) +
+                        ggplot2::geom_hline(
+                            yintercept = c(-lfc_threshold, lfc_threshold),
+                            linetype = "dotted", color = "#D73027",
+                            linewidth = 0.4)
+                }
             } else {
                 # Upper triangle: correlation
                 r <- stats::cor(top_tables[[i]]$logFC,
@@ -1256,7 +1320,7 @@ build_rmse_density_panel <- function(winning_models, design_names,
 
 #' P-value histograms
 #' @noRd
-build_pvalue_panel <- function(top_tables, design_names) {
+build_pvalue_panel <- function(top_tables, design_names, lfc_threshold = 0) {
     rows <- lapply(design_names, function(d) {
         data.frame(design = d, pvalue = top_tables[[d]]$P.Value,
                    stringsAsFactors = FALSE)
@@ -1267,6 +1331,13 @@ build_pvalue_panel <- function(top_tables, design_names) {
     n_genes <- nrow(top_tables[[1]])
     uniform_height <- n_genes / 50  # 50 bins
 
+    pval_title <- if (lfc_threshold > 0) {
+        paste0("P-value distribution (treat, |logFC| > ",
+               round(lfc_threshold, 2), ")")
+    } else {
+        "P-value distribution"
+    }
+
     ggplot2::ggplot(df, ggplot2::aes(x = pvalue)) +
         ggplot2::geom_histogram(bins = 50, fill = "#4575B4",
                                 color = "white", linewidth = 0.2) +
@@ -1274,18 +1345,25 @@ build_pvalue_panel <- function(top_tables, design_names) {
                             linetype = "dashed", color = "#D73027") +
         ggplot2::facet_wrap(~ design) +
         ggplot2::theme_minimal() +
-        ggplot2::labs(title = "P-value distribution", x = "P-value",
-                      y = "Count")
+        ggplot2::labs(title = pval_title, x = "P-value", y = "Count")
 }
 
 
 #' Selection path annotation panel
 #' @noRd
-build_selection_path_panel <- function(selection) {
+build_selection_path_panel <- function(selection, lfc_threshold = 0,
+                                       fdr_threshold = 0.05) {
     lines <- c(
         paste0("Selected: ", selection$design, " / ", selection$recommended),
         paste0("Reason: ", selection$reason)
     )
+    if (lfc_threshold > 0 || fdr_threshold != 0.05) {
+        lines <- c(lines, paste0(
+            "Thresholds: FDR < ", fdr_threshold,
+            if (lfc_threshold > 0)
+                paste0(", |logFC| > ", round(lfc_threshold, 2), " (treat)")
+            else ""))
+    }
     label <- paste(lines, collapse = "\n")
 
     ggplot2::ggplot() +
